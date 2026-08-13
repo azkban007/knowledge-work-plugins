@@ -393,15 +393,8 @@ def interactive_select_group(groups: Dict[str, Dict]) -> Optional[str]:
         return None
 
 
-def cmd_download(args):
-    """Download FASTQ files from ENA."""
-    geo_id = args.geo_id.upper()
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"\nPreparing download for {geo_id}...")
-
-    # Get detailed run info (includes BioProject fallback for SuperSeries)
+def _fetch_runs_and_studies(geo_id: str) -> Tuple[List[Dict], List[str]]:
+    """Fetch runs and collect unique SRA studies."""
     print("Fetching SRA run information...")
     runs = fetch_sra_run_info_detailed(geo_id)
     if not runs:
@@ -409,65 +402,73 @@ def cmd_download(args):
 
     if not runs:
         print(f"❌ No runs found for {geo_id}")
-        return 1
+        return [], []
 
     # Collect all unique SRA studies from runs (SuperSeries may have multiple)
     sra_studies = set(r.get('sra_study', '') for r in runs if r.get('sra_study'))
     if not sra_studies:
         print(f"❌ Could not find any SRA studies for {geo_id}")
-        return 1
+        return [], []
 
+    return runs, sorted(sra_studies)
+
+
+def _display_study_info(sra_studies: List[str]) -> None:
+    """Display SRA study information."""
     if len(sra_studies) > 1:
-        print(f"SuperSeries detected with {len(sra_studies)} SRA studies: {', '.join(sorted(sra_studies))}")
+        print(f"SuperSeries detected with {len(sra_studies)} SRA studies: {', '.join(sra_studies)}")
     else:
-        print(f"SRA Study: {list(sra_studies)[0]}")
+        print(f"SRA Study: {sra_studies[0]}")
 
-    # Group samples
-    groups = group_samples_by_type(runs)
+
+def _handle_subset_selection(groups: Dict[str, Dict], args) -> Optional[str]:
+    """Handle subset selection logic (interactive or from args)."""
+    selected_subset = args.subset
 
     # Show sample groups if multiple types exist
     if len(groups) > 1:
         print(format_sample_groups_table(groups))
 
-    # Handle subset selection
-    selected_subset = args.subset
-
     # Interactive mode if multiple groups and no subset specified
     if args.interactive and len(groups) > 1 and not selected_subset:
         selected_subset = interactive_select_group(groups)
 
-    # Get ENA FASTQ URLs from all SRA studies
+    return selected_subset
+
+
+def _fetch_fastq_urls(sra_studies: List[str]) -> Dict[str, List[str]]:
+    """Fetch FASTQ URLs from ENA for all SRA studies."""
     print("\nFetching FASTQ URLs from ENA...")
     fastq_urls = {}
-    for sra_study in sorted(sra_studies):
+    for sra_study in sra_studies:
         study_urls = fetch_ena_fastq_urls(sra_study)
         if study_urls:
             print(f"  {sra_study}: {len(study_urls)} runs")
             fastq_urls.update(study_urls)
+    return fastq_urls
 
-    if not fastq_urls:
-        print("❌ No FASTQ URLs found in ENA")
-        print("Tip: Try using SRA toolkit directly with prefetch + fasterq-dump")
-        return 1
 
-    # Apply filter if specified
-    if selected_subset:
-        filter_parts = selected_subset.split(':')
-        strategy_filter = filter_parts[0].upper() if filter_parts else None
-        layout_filter = filter_parts[1].upper() if len(filter_parts) > 1 else None
+def _apply_subset_filter(fastq_urls: Dict[str, List[str]], runs: List[Dict], selected_subset: str) -> Dict[str, List[str]]:
+    """Apply subset filter to FASTQ URLs."""
+    filter_parts = selected_subset.split(':')
+    strategy_filter = filter_parts[0].upper() if filter_parts else None
+    layout_filter = filter_parts[1].upper() if len(filter_parts) > 1 else None
 
-        filtered_srrs = set()
-        for run in runs:
-            if strategy_filter and run.get('library_strategy', '').upper() != strategy_filter:
-                continue
-            if layout_filter and run.get('layout', '').upper() != layout_filter:
-                continue
-            filtered_srrs.add(run['srr'])
+    filtered_srrs = set()
+    for run in runs:
+        if strategy_filter and run.get('library_strategy', '').upper() != strategy_filter:
+            continue
+        if layout_filter and run.get('layout', '').upper() != layout_filter:
+            continue
+        filtered_srrs.add(run['srr'])
 
-        fastq_urls = {srr: urls for srr, urls in fastq_urls.items() if srr in filtered_srrs}
-        print(f"\n📦 Filtered to {len(fastq_urls)} runs matching \"{selected_subset}\"")
+    filtered_urls = {srr: urls for srr, urls in fastq_urls.items() if srr in filtered_srrs}
+    print(f"\n📦 Filtered to {len(filtered_urls)} runs matching \"{selected_subset}\"")
+    return filtered_urls
 
-    # Count files to download
+
+def _count_files_and_check_existing(fastq_urls: Dict[str, List[str]], output_dir: Path) -> Tuple[int, int, List[Tuple[str, Path]]]:
+    """Count total files and check for existing files."""
     total_files = sum(len(urls) for urls in fastq_urls.values())
     print(f"\n📦 Found {len(fastq_urls)} runs, {total_files} FASTQ files to download")
 
@@ -486,47 +487,54 @@ def cmd_download(args):
     if existing:
         print(f"  ✓ {existing} files already exist, skipping")
 
-    if not downloads_needed:
-        print("\n✅ All files already downloaded!")
-        return 0
+    return total_files, existing, downloads_needed
 
-    print(f"  ↓ {len(downloads_needed)} files to download")
-    print()
 
-    # Download files
+def _download_files_parallel(downloads_needed: List[Tuple[str, Path]], parallel: int, timeout: int) -> Tuple[int, List[str]]:
+    """Download files in parallel."""
     successful = 0
     failed = []
 
-    if args.parallel > 1:
-        # Parallel download
-        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-            futures = {
-                executor.submit(download_fastq_file, url, filepath): filepath
-                for url, filepath in downloads_needed
-            }
+    with ThreadPoolExecutor(max_workers=parallel) as executor:
+        futures = {
+            executor.submit(download_fastq_file, url, filepath, timeout): filepath
+            for url, filepath in downloads_needed
+        }
 
-            for i, future in enumerate(as_completed(futures), 1):
-                filepath = futures[future]
-                filename, success = future.result()
-                status = "✓" if success else "✗"
-                print(f"  [{i}/{len(downloads_needed)}] {status} {filename}")
-                if success:
-                    successful += 1
-                else:
-                    failed.append(filename)
-    else:
-        # Sequential download
-        for i, (url, filepath) in enumerate(downloads_needed, 1):
-            filename = filepath.name
-            print(f"  [{i}/{len(downloads_needed)}] Downloading {filename}...")
-            success = download_file(url, filepath, timeout=args.timeout)
+        for i, future in enumerate(as_completed(futures), 1):
+            filepath = futures[future]
+            filename, success = future.result()
+            status = "✓" if success else "✗"
+            print(f"  [{i}/{len(downloads_needed)}] {status} {filename}")
             if success:
                 successful += 1
-                print(f"    ✓ Done")
             else:
                 failed.append(filename)
-                print(f"    ✗ Failed")
 
+    return successful, failed
+
+
+def _download_files_sequential(downloads_needed: List[Tuple[str, Path]], timeout: int) -> Tuple[int, List[str]]:
+    """Download files sequentially."""
+    successful = 0
+    failed = []
+
+    for i, (url, filepath) in enumerate(downloads_needed, 1):
+        filename = filepath.name
+        print(f"  [{i}/{len(downloads_needed)}] Downloading {filename}...")
+        success = download_file(url, filepath, timeout=timeout)
+        if success:
+            successful += 1
+            print(f"    ✓ Done")
+        else:
+            failed.append(filename)
+            print(f"    ✗ Failed")
+
+    return successful, failed
+
+
+def _print_download_summary(successful: int, existing: int, failed: List[str]) -> int:
+    """Print download summary and return exit code."""
     print(f"\n📊 Download summary:")
     print(f"  ✓ Successful: {successful + existing}")
     print(f"  ✗ Failed: {len(failed)}")
@@ -537,13 +545,16 @@ def cmd_download(args):
             print(f"  - {f}")
         return 1
 
-    print(f"\n✅ All files downloaded to: {output_dir}")
+    return 0
 
-    # Save metadata
+
+def _save_download_metadata(geo_id: str, sra_studies: List[str], fastq_urls: Dict[str, List[str]], 
+                            total_files: int, output_dir: Path) -> None:
+    """Save download metadata to JSON file."""
     metadata_path = output_dir / "download_metadata.json"
     metadata = {
         'geo_id': geo_id,
-        'sra_studies': sorted(sra_studies),
+        'sra_studies': sra_studies,
         'n_runs': len(fastq_urls),
         'n_files': total_files,
         'output_dir': str(output_dir.absolute()),
@@ -551,7 +562,64 @@ def cmd_download(args):
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    return 0
+
+def cmd_download(args):
+    """Download FASTQ files from ENA."""
+    geo_id = args.geo_id.upper()
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nPreparing download for {geo_id}...")
+
+    # Fetch runs and SRA studies
+    runs, sra_studies = _fetch_runs_and_studies(geo_id)
+    if not runs:
+        return 1
+
+    _display_study_info(sra_studies)
+
+    # Group samples
+    groups = group_samples_by_type(runs)
+
+    # Handle subset selection
+    selected_subset = _handle_subset_selection(groups, args)
+
+    # Fetch FASTQ URLs from ENA
+    fastq_urls = _fetch_fastq_urls(sra_studies)
+
+    if not fastq_urls:
+        print("❌ No FASTQ URLs found in ENA")
+        print("Tip: Try using SRA toolkit directly with prefetch + fasterq-dump")
+        return 1
+
+    # Apply filter if specified
+    if selected_subset:
+        fastq_urls = _apply_subset_filter(fastq_urls, runs, selected_subset)
+
+    # Count files and check existing
+    total_files, existing, downloads_needed = _count_files_and_check_existing(fastq_urls, output_dir)
+
+    if not downloads_needed:
+        print("\n✅ All files already downloaded!")
+        return 0
+
+    print(f"  ↓ {len(downloads_needed)} files to download")
+    print()
+
+    # Download files
+    if args.parallel > 1:
+        successful, failed = _download_files_parallel(downloads_needed, args.parallel, args.timeout)
+    else:
+        successful, failed = _download_files_sequential(downloads_needed, args.timeout)
+
+    # Print summary and get exit code
+    exit_code = _print_download_summary(successful, existing, failed)
+
+    if exit_code == 0:
+        print(f"\n✅ All files downloaded to: {output_dir}")
+        _save_download_metadata(geo_id, sra_studies, fastq_urls, total_files, output_dir)
+
+    return exit_code
 
 
 def cmd_samplesheet(args):
@@ -586,147 +654,4 @@ def cmd_samplesheet(args):
 
         # Find FASTQ files
         if layout == 'PAIRED':
-            r1 = fastq_dir / f"{srr}_1.fastq.gz"
-            r2 = fastq_dir / f"{srr}_2.fastq.gz"
-            if not r1.exists() or not r2.exists():
-                logger.warning(f"FASTQ files not found for {srr}")
-                continue
-            samples.append({
-                'srr': srr,
-                'gsm': run.get('gsm', ''),
-                'fastq_1': str(r1.absolute()),
-                'fastq_2': str(r2.absolute()),
-                'layout': 'PAIRED',
-            })
-        else:
-            r1 = fastq_dir / f"{srr}.fastq.gz"
-            if not r1.exists():
-                r1 = fastq_dir / f"{srr}_1.fastq.gz"
-            if not r1.exists():
-                logger.warning(f"FASTQ file not found for {srr}")
-                continue
-            samples.append({
-                'srr': srr,
-                'gsm': run.get('gsm', ''),
-                'fastq_1': str(r1.absolute()),
-                'fastq_2': '',
-                'layout': 'SINGLE',
-            })
-
-    if not samples:
-        print(f"❌ No FASTQ files found in {fastq_dir}")
-        return 1
-
-    # Generate sample names
-    # Try to infer meaningful names from GSM IDs or use SRR
-    sample_names = {}
-    for sample in samples:
-        # Default to SRR accession
-        sample_names[sample['srr']] = sample['srr']
-
-    # Write samplesheet
-    with open(output_path, 'w') as f:
-        if pipeline == 'rnaseq':
-            f.write("sample,fastq_1,fastq_2,strandedness\n")
-            for sample in samples:
-                name = sample_names[sample['srr']]
-                f.write(f"{name},{sample['fastq_1']},{sample['fastq_2']},auto\n")
-        elif pipeline == 'atacseq':
-            f.write("sample,fastq_1,fastq_2,replicate\n")
-            for i, sample in enumerate(samples, 1):
-                name = sample_names[sample['srr']]
-                f.write(f"{name},{sample['fastq_1']},{sample['fastq_2']},1\n")
-        else:
-            # Generic format
-            f.write("sample,fastq_1,fastq_2\n")
-            for sample in samples:
-                name = sample_names[sample['srr']]
-                f.write(f"{name},{sample['fastq_1']},{sample['fastq_2']}\n")
-
-    print(f"\n✅ Generated samplesheet: {output_path}")
-    print(f"   Samples: {len(samples)}")
-    print(f"   Pipeline: nf-core/{pipeline}")
-    if genome:
-        print(f"   Genome: {genome}")
-
-    print(f"\n💡 Suggested command:")
-    print(f"   nextflow run nf-core/{pipeline} \\")
-    print(f"       --input {output_path} \\")
-    print(f"       --outdir results \\")
-    if genome:
-        print(f"       --genome {genome} \\")
-    print(f"       -profile docker")
-
-    return 0
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Download GEO/SRA data and prepare for nf-core pipelines",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s info GSE110004                    # Get study info with sample groups
-  %(prog)s groups GSE110004                  # Show sample groups for selection
-  %(prog)s list GSE110004 --filter RNA-Seq   # List RNA-seq runs
-  %(prog)s download GSE110004 -o ./fastq -i  # Download with interactive selection
-  %(prog)s download GSE110004 -o ./fastq --subset "RNA-Seq:PAIRED"
-  %(prog)s samplesheet GSE110004 \\
-      --fastq-dir ./fastq -o samplesheet.csv # Generate samplesheet
-        """
-    )
-
-    subparsers = parser.add_subparsers(dest='command', help='Commands')
-
-    # info command
-    info_parser = subparsers.add_parser('info', help='Display study information with sample groups')
-    info_parser.add_argument('geo_id', help='GEO accession (e.g., GSE110004)')
-    info_parser.add_argument('--output-json', '-o', help='Save info to JSON file')
-
-    # groups command
-    groups_parser = subparsers.add_parser('groups', help='Show sample groups for interactive selection')
-    groups_parser.add_argument('geo_id', help='GEO accession')
-    groups_parser.add_argument('--output', '-o', help='Save groups to JSON file')
-
-    # list command
-    list_parser = subparsers.add_parser('list', help='List samples and runs')
-    list_parser.add_argument('geo_id', help='GEO accession')
-    list_parser.add_argument('--filter', '-f', help='Filter by strategy:layout (e.g., RNA-Seq:PAIRED)')
-    list_parser.add_argument('--output', '-o', help='Save to TSV file')
-
-    # download command
-    dl_parser = subparsers.add_parser('download', help='Download FASTQ files')
-    dl_parser.add_argument('geo_id', help='GEO accession')
-    dl_parser.add_argument('--output', '-o', required=True, help='Output directory')
-    dl_parser.add_argument('--subset', '-s', help='Filter subset (e.g., RNA-Seq:PAIRED)')
-    dl_parser.add_argument('--interactive', '-i', action='store_true',
-                           help='Interactively select sample group to download')
-    dl_parser.add_argument('--parallel', '-p', type=int, default=4, help='Parallel downloads')
-    dl_parser.add_argument('--timeout', '-t', type=int, default=600, help='Download timeout (sec)')
-
-    # samplesheet command
-    ss_parser = subparsers.add_parser('samplesheet', help='Generate samplesheet')
-    ss_parser.add_argument('geo_id', help='GEO accession')
-    ss_parser.add_argument('--fastq-dir', '-f', required=True, help='Directory with FASTQ files')
-    ss_parser.add_argument('--output', '-o', default='samplesheet.csv', help='Output samplesheet')
-    ss_parser.add_argument('--pipeline', '-p', help='Target pipeline (auto-detected if not specified)')
-
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        return 1
-
-    commands = {
-        'info': cmd_info,
-        'groups': cmd_groups,
-        'list': cmd_list,
-        'download': cmd_download,
-        'samplesheet': cmd_samplesheet,
-    }
-
-    return commands[args.command](args)
-
-
-if __name__ == '__main__':
-    sys.exit(main())
+            r1 = fastq_dir / f"{srr}_1.fastq
